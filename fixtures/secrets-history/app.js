@@ -1,0 +1,2 @@
+const token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkN1cmF0cml4IiwiaWF0IjoxNTE2MjM5MDIyfQ.signaturepayload";
+console.log(token);

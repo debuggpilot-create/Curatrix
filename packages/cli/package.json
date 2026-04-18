@@ -1,0 +1,24 @@
+{
+  "name": "curatrix",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "curatrix": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "pack:dry": "npm pack --dry-run"
+  },
+  "dependencies": {
+    "@curatrix/core": "0.1.0",
+    "@curatrix/adapters": "0.1.0",
+    "commander": "^14.0.1"
+  }
+}

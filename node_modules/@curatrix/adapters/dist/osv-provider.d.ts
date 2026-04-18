@@ -1,0 +1,13 @@
+import type { PackageVulnProvider, ProviderContext, VulnerabilityRecord } from "@curatrix/core";
+export declare class OsvVulnerabilityProvider implements PackageVulnProvider {
+    readonly name = "osv";
+    private availableTokens;
+    private lastRefillAt;
+    getVulnerabilities(packageNames: string[], context: ProviderContext): Promise<VulnerabilityRecord[]>;
+    private fetchPackage;
+    private readDependencyVersions;
+    private readCache;
+    private writeCache;
+    private takeToken;
+    private refillTokens;
+}

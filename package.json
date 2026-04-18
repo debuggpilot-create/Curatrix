@@ -1,0 +1,21 @@
+{
+  "name": "@curatrix/workspace",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "test": "npm run build && node --test tests/**/*.test.js",
+    "lint": "tsc -b --pretty false --noEmit",
+    "curatrix": "node packages/cli/dist/index.js",
+    "link": "npm run build && npm link --workspace curatrix",
+    "pack:dry": "npm run pack:dry --workspace curatrix"
+  },
+  "devDependencies": {
+    "@types/node": "^24.6.0",
+    "typescript": "^5.9.3"
+  }
+}
