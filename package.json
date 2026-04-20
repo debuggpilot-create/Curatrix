@@ -8,9 +8,10 @@
   ],
   "scripts": {
     "build": "npm run build --workspaces",
-    "test": "npm run build && node --test tests/curatrix.test.js",
+    "test": "npm run build && node --test tests/curatrix.test.js tests/mcp-contract.test.js",
     "lint": "tsc -b --pretty false --noEmit",
     "curatrix": "node packages/cli/dist/index.js",
+    "mcp:start": "tsx packages/mcp-server/src/index.ts",
     "link": "npm run build && npm link --workspace curatrix",
     "pack:dry": "npm run pack:dry --workspace curatrix"
   },

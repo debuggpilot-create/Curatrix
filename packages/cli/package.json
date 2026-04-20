@@ -20,5 +20,7 @@
     "@curatrix/core": "0.1.0",
     "@curatrix/adapters": "0.1.0",
     "commander": "^14.0.1"
+  },
+  "devDependencies": {
   }
 }

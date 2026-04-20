@@ -2,8 +2,9 @@
 import process from "node:process";
 import { readFileSync } from "node:fs";
 import { Command, Help, Option } from "commander/esm.mjs";
-import { applyFix, compareWithBaseline, createFixPlan, saveBaseline, scanProject } from "@curatrix/core";
+import { applyFixes, compareWithBaseline, createFixPlan, saveBaseline, scanProject } from "@curatrix/core";
 import { OsvVulnerabilityProvider } from "@curatrix/adapters";
+import { outputResult, renderFixPreview, renderFixResult } from "./output.js";
 const CLI_PACKAGE = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 const osvProvider = new OsvVulnerabilityProvider();
 const helpMetadata = new WeakMap();
@@ -73,8 +74,8 @@ function createProgram() {
     setHelpMetadata(program, {
         examples: [
             "curatrix scan .",
-            "curatrix scan fixtures/node-risky --format json",
-            "curatrix fix fixtures/agent-risky --issue <id> --dry-run",
+            "curatrix scan fixtures/node-risky --format json --enable-ai-audit",
+            "curatrix fix . --issue <id> --apply",
         ],
         exitCodes: [
             "0  Command completed successfully.",
@@ -85,11 +86,20 @@ function createProgram() {
         .command("scan")
         .description("Run a deterministic local project audit.")
         .argument("[path]", "Project path to scan", process.cwd())
-        .addOption(new Option("--format <format>", "Output format").choices(["text", "json"]).default("text"))
+        .addOption(new Option("--format <format>", "Output format").choices(["text", "json", "markdown"]).default("text"))
         .addOption(new Option("--baseline <mode>", "Baseline action to perform").choices(["set", "compare"]))
         .option("--ci", "Exit non-zero on high or critical findings")
+        .option("--enable-ai-audit", "Run AI-assisted semantic auditing using the OpenAI API")
+        .option("--ai-key <key>", "OpenAI API key for AI-assisted audit")
         .action(async (rootDir, options) => {
-        let result = await scanProject({ rootDir, ci: options.ci ?? false, vulnerabilityProvider: osvProvider });
+        const aiApiKey = options.enableAiAudit ? await resolveAiKey(options.aiKey) : undefined;
+        let result = await scanProject({
+            rootDir,
+            ci: options.ci ?? false,
+            vulnerabilityProvider: osvProvider,
+            enableAiAudit: options.enableAiAudit ?? false,
+            aiApiKey,
+        });
         if (options.baseline === "compare") {
             result = await compareWithBaseline(rootDir, result);
         }
@@ -99,20 +109,21 @@ function createProgram() {
                 process.stdout.write(`${JSON.stringify({ baselinePath, result }, null, 2)}\n`);
             }
             else {
-                process.stdout.write(renderText(result));
+                process.stdout.write(outputResult(result, options.format));
                 process.stdout.write(`\nBaseline saved to ${baselinePath}\n`);
             }
         }
         else {
-            outputResult(result, options.format);
+            process.stdout.write(outputResult(result, options.format));
         }
         process.exitCode = shouldFailCi(result, options.ci ?? false) ? 1 : 0;
     });
     setHelpMetadata(scanCommand, {
         examples: [
             "curatrix scan .",
-            "curatrix scan ./repo --baseline compare",
+            "curatrix scan ./repo --enable-ai-audit",
             "curatrix scan ./repo --format json --ci",
+            "curatrix scan ./repo --format markdown",
         ],
         exitCodes: [
             "0  Scan completed and no CI threshold was breached.",
@@ -121,30 +132,65 @@ function createProgram() {
     });
     const fixCommand = program
         .command("fix")
-        .description("Preview or apply a safe automated fix for a specific issue.")
+        .description("Preview or apply fixes for a specific issue.")
         .argument("[path]", "Project path containing the issue", process.cwd())
         .requiredOption("--issue <id>", "Issue id or fingerprint to fix")
         .addOption(new Option("--format <format>", "Output format").choices(["text", "json"]).default("text"))
         .option("--apply", "Apply the generated fix")
         .option("--dry-run", "Preview the generated fix without writing files")
+        .option("--enable-ai-audit", "Include AI findings when locating the target issue")
+        .option("--ai-key <key>", "OpenAI API key for AI-assisted audit")
         .action(async (rootDir, options) => {
-        const plan = options.apply
-            ? await applyFix({ rootDir, issueId: options.issue, apply: true, vulnerabilityProvider: osvProvider })
-            : await createFixPlan(rootDir, options.issue, { vulnerabilityProvider: osvProvider });
+        const aiApiKey = options.enableAiAudit ? await resolveAiKey(options.aiKey) : undefined;
+        const result = await scanProject({
+            rootDir,
+            vulnerabilityProvider: osvProvider,
+            enableAiAudit: options.enableAiAudit ?? false,
+            aiApiKey,
+        });
+        const issue = result.issues.find((entry) => entry.id === options.issue || entry.fingerprint === options.issue);
+        if (!issue) {
+            throw new Error(`Issue ${options.issue} was not found in a fresh scan.`);
+        }
+        if (!options.apply) {
+            const preview = issue.patch
+                ? {
+                    issueId: issue.id,
+                    fixType: issue.ruleId,
+                    summary: issue.remediation ?? "AI audit generated a candidate patch.",
+                    patchPreview: issue.patch,
+                    riskLevel: "medium",
+                    reversible: true,
+                    requiresReview: true,
+                    applySteps: ["Review the patch carefully before applying it."],
+                }
+                : await createFixPlan(rootDir, issue.id, { vulnerabilityProvider: osvProvider });
+            if (options.format === "json") {
+                process.stdout.write(`${JSON.stringify(preview, null, 2)}\n`);
+            }
+            else {
+                process.stdout.write(renderFixPreview(issue, preview.patchPreview));
+            }
+            return;
+        }
+        const applyResult = await applyFixes({
+            rootDir,
+            issues: [issue],
+            autoConfirm: true,
+            vulnerabilityProvider: osvProvider,
+        });
         if (options.format === "json") {
-            process.stdout.write(`${JSON.stringify(plan, null, 2)}\n`);
+            process.stdout.write(`${JSON.stringify(applyResult, null, 2)}\n`);
         }
         else {
-            process.stdout.write(`Fix: ${plan.summary}\n`);
-            process.stdout.write(`Risk: ${plan.riskLevel} | Reversible: ${String(plan.reversible)} | Requires review: ${String(plan.requiresReview)}\n\n`);
-            process.stdout.write(`${plan.patchPreview}\n`);
+            process.stdout.write(renderFixResult(issue, applyResult));
         }
     });
     setHelpMetadata(fixCommand, {
         examples: [
             "curatrix fix . --issue abc123 --dry-run",
             "curatrix fix ./repo --issue abc123 --apply",
-            "curatrix fix ./repo --issue abc123 --format json",
+            "curatrix fix ./repo --issue abc123 --enable-ai-audit",
         ],
         exitCodes: [
             "0  Fix preview or apply completed successfully.",
@@ -160,38 +206,26 @@ function setHelpMetadata(command, metadata) {
         formatHelp: (target, helper) => new StructuredHelp().formatHelp(target, helper),
     });
 }
-function outputResult(result, format) {
-    if (format === "json") {
-        process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-        return;
+async function resolveAiKey(cliKey) {
+    const providedKey = cliKey ?? process.env.OPENAI_API_KEY;
+    if (providedKey) {
+        return providedKey;
     }
-    process.stdout.write(renderText(result));
-}
-function renderText(result) {
-    const lines = [];
-    lines.push(`Curatrix scan for ${result.project.name}`);
-    lines.push(`Issues: ${result.summary.totalIssues}`);
-    lines.push(`Severity counts: critical=${result.summary.bySeverity.critical}, high=${result.summary.bySeverity.high}, medium=${result.summary.bySeverity.medium}, low=${result.summary.bySeverity.low}`);
-    if (result.artifacts.baselineDelta) {
-        lines.push(`Baseline delta: new=${result.artifacts.baselineDelta.new}, resolved=${result.artifacts.baselineDelta.resolved}, unchanged=${result.artifacts.baselineDelta.unchanged}`);
+    if (!process.stdin.isTTY || !process.stdout.isTTY) {
+        throw new Error("AI audit is enabled but no OpenAI API key was provided. Use --ai-key or OPENAI_API_KEY.");
     }
-    lines.push("");
-    for (const issue of result.issues) {
-        const location = issue.locations[0];
-        lines.push(`[${issue.severity.toUpperCase()}] ${issue.title}`);
-        lines.push(`  id: ${issue.id}`);
-        lines.push(`  rule: ${issue.ruleId}`);
-        lines.push(`  file: ${location?.file ?? "<unknown>"}${location?.line ? `:${location.line}` : ""}`);
-        lines.push(`  why: ${issue.why}`);
-        if (issue.baselineStatus) {
-            lines.push(`  baseline: ${issue.baselineStatus}`);
+    const { createInterface } = await import("node:readline/promises");
+    const readline = createInterface({ input: process.stdin, output: process.stdout });
+    try {
+        const answer = await readline.question("Enter OpenAI API key: ");
+        if (!answer.trim()) {
+            throw new Error("AI audit requires an OpenAI API key.");
         }
-        for (const evidence of issue.evidence) {
-            lines.push(`  evidence: ${evidence.label}=${evidence.value}`);
-        }
-        lines.push("");
+        return answer.trim();
     }
-    return `${lines.join("\n")}\n`;
+    finally {
+        readline.close();
+    }
 }
 function shouldFailCi(result, ci) {
     if (!ci) {

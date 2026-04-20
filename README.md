@@ -1,4 +1,4 @@
-# Curatrix ???
+# Curatrix 🛡️
 
 Universal project health & security curator. Local-first. Deterministic. AI-ready.
 
@@ -12,6 +12,18 @@ Curatrix helps you audit repositories for security, supply-chain risk, infrastru
 - CI-friendly: non-zero exits when configured thresholds are breached
 - AI-ready: agent-specific checks ship today, deeper AI analysis can be layered later
 - Extensible: adapters, config files, and stable JSON output are built in from the start
+
+## Features
+
+- Advanced supply-chain protection with transitive dependency depth scanning
+- Install-script detection for risky `preinstall`, `install`, `postinstall`, and `prepare` hooks
+- Package reputation scoring for very new packages, unproven maintainers, and suspicious version jumps
+- VEX-aware suppression for known false positives
+- Secrets and git-history attribution
+- Infrastructure and CI hardening checks
+- AI-agent security checks for prompt boundaries, unsafe execution, and exposed bind addresses
+- Human-readable terminal, JSON, and GitHub-flavored Markdown output
+- MCP tool support with correction context and fix summaries for AI agents
 
 ## Installation
 
@@ -33,6 +45,12 @@ Generate JSON output for scripts or CI:
 
 ```bash
 curatrix scan . --format json
+```
+
+Generate GitHub-flavored Markdown for PR comments or review notes:
+
+```bash
+curatrix scan . --format markdown
 ```
 
 Save and compare a local baseline:
@@ -62,7 +80,7 @@ curatrix scan --help
 curatrix fix --help
 ```
 
-## What Curatrix Checks in v0.1.0
+## What Curatrix Checks in v0.2.0
 
 ### Dependency and Supply Chain
 - Weak or floating version ranges in `package.json`
@@ -70,6 +88,9 @@ curatrix fix --help
 - Missing Node lockfiles
 - Optional OSV-backed vulnerability lookups with local caching
 - Basic usage-aware severity reduction for declared-but-unused dependencies
+- Transitive dependency depth scanning for nested vulnerable packages
+- Package reputation scoring for new packages, limited maintainer history, and suspicious release jumps
+- VEX-based suppression for components marked `not_affected` or `fixed`
 
 ### Secrets and Git Hygiene
 - Known secret patterns such as AWS keys, Stripe keys, JWTs, and private keys
@@ -95,6 +116,7 @@ curatrix fix --help
 ## Output Model
 
 Curatrix produces both readable terminal output and stable JSON output.
+It also supports GitHub-flavored Markdown table output for sharing scan results in pull requests.
 
 Each finding includes:
 - `ruleId`
@@ -105,6 +127,14 @@ Each finding includes:
 - fix availability
 
 JSON scan results also include top-level config state for the run, including enabled modules, ignored rules, and severity overrides.
+
+Markdown output is designed for copy-paste into GitHub pull requests:
+
+```bash
+curatrix scan . --format markdown > curatrix-report.md
+```
+
+Then paste the generated table into a PR comment or review summary.
 
 ## Safe Fixes
 
@@ -143,7 +173,9 @@ Curatrix supports layered configuration:
   "severityOverrides": {
     "deps.missing-lockfile": "high"
   },
-  "baselineDir": "./.curatrix-baselines"
+  "baselineDir": "./.curatrix-baselines",
+  "maxDepth": 8,
+  "vexFile": ".curatrix.vex.json"
 }
 ```
 
@@ -161,6 +193,8 @@ Curatrix supports layered configuration:
 - `modules`: enable or disable major scan modules
 - `severityOverrides`: override severity by `ruleId`
 - `baselineDir`: customize where baseline snapshots are stored
+- `maxDepth`: limit transitive dependency traversal depth, default `Infinity`
+- `vexFile`: optional CSAF VEX file used to suppress known false positives
 - `.curatrixignore.json`: suppress findings by `ruleId`
 
 If config files are missing or malformed, Curatrix falls back to safe defaults.
@@ -189,7 +223,7 @@ With `--ci`, Curatrix exits non-zero when high or critical findings are present.
 ### `curatrix scan`
 
 ```bash
-curatrix scan [path] [--format text|json] [--baseline set|compare] [--ci]
+curatrix scan [path] [--format text|json|markdown] [--baseline set|compare] [--ci]
 ```
 
 ### `curatrix fix`
@@ -203,6 +237,61 @@ curatrix fix [path] --issue <id> [--dry-run|--apply] [--format text|json]
 ```bash
 curatrix --version
 ```
+
+## 🤖 AI Agent Integration (MCP)
+
+Curatrix includes an MCP server package so AI agents can invoke repository scans and automated fixes as tools.
+Curatrix doesn't just find bugs; it explains them and provides fixes.
+
+Available MCP tools:
+- `curatrix_scan`: runs a static Curatrix scan and returns structured results
+- `curatrix_fix`: applies requested or fixable Curatrix remediations and returns a summary
+
+Each MCP finding includes correction context that an AI agent can quote directly to a user:
+
+```json
+{
+  "ruleId": "deps.transitive-cve",
+  "severity": "high",
+  "description": "left-pad@1.0.1 has a provider-reported advisory.",
+  "correctionContext": {
+    "type": "dependency-update",
+    "action": "Review the dependency and update to a safe version.",
+    "reasoning": "I recommend updating this dependency because the current version is tied to a reported vulnerability and the safer version reduces known risk.",
+    "confidence": 0.8
+  }
+}
+```
+
+Start the server from the workspace root:
+
+```bash
+npm run mcp:start
+```
+
+Example Claude Desktop or Cursor MCP config:
+
+```json
+{
+  "mcpServers": {
+    "curatrix": {
+      "command": "npm",
+      "args": ["run", "mcp:start"],
+      "cwd": "C:\\Users\\rishi\\Curatrix"
+    }
+  }
+}
+```
+
+The MCP package docs are available in `packages/mcp-server/README.md`.
+
+## VEX Support
+
+Curatrix supports a minimal CSAF 2.0 VEX flow for vulnerability suppression.
+
+- Add `.curatrix.vex.json` to your project root to suppress known-false positives.
+- Or point `vexFile` in `.curatrixrc.json` at a different CSAF VEX JSON file.
+- Curatrix currently honors `not_affected` and `fixed` component mappings from the core CSAF fields it parses.
 
 ## Development
 
@@ -247,14 +336,17 @@ npm run pack:dry
 
 ## Current Scope
 
-Curatrix v0.1.0 is intentionally focused on a trustworthy MVP:
+Curatrix v0.2.0 is intentionally focused on a trustworthy local-first release:
 - deterministic local scanning
 - stable JSON output
+- markdown output for PRs and reviews
 - baseline save/compare
 - a small set of safe automated fixes
+- advanced supply-chain analysis for depth, install scripts, reputation, and VEX
+- MCP correction context and fix summaries for AI agents
 - adapter and config seams for future expansion
 
-The following are intentionally deferred beyond v0.1.0:
+The following are intentionally deferred beyond v0.2.0:
 - MCP transport
 - SBOM generation
 - malware scanning

@@ -2,6 +2,7 @@ import path from "node:path";
 import { promises as fs } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { runAiAudit } from "./ai-audit.js";
 import { createIssueId, emptySummary } from "./types.js";
 import { loadCuratrixConfig } from "./config.js";
 import { ensureDirectory, listFiles, pathExists, readJsonFile, readTextIfExists, relative, writeText } from "./fs.js";
@@ -12,13 +13,16 @@ export async function scanProject(options) {
     const startedAt = new Date(startedAtMs).toISOString();
     const rootDir = path.resolve(options.rootDir);
     const config = await loadCuratrixConfig(rootDir);
+    const vexEntries = await loadVexEntries(rootDir, config);
     const files = await listFiles(rootDir);
-    const packageIssues = config.modules.dependencies ? await scanDependencies(rootDir, files, options) : [];
+    const packageIssues = config.modules.dependencies ? await scanDependencies(rootDir, files, options, config, vexEntries) : [];
     const secretIssues = config.modules.secrets ? await scanSecrets(rootDir, files) : [];
     const infraIssues = config.modules.infrastructure ? await scanInfrastructure(rootDir, files) : [];
     const aiIssues = config.modules.aiAgent ? await scanAiAgent(rootDir, files) : [];
+    const semanticIssues = options.enableAiAudit && options.aiApiKey ? await runAiAudit({ rootDir, apiKey: options.aiApiKey }) : [];
     const issues = applyConfigToIssues([...packageIssues, ...secretIssues, ...infraIssues, ...aiIssues], config)
         .map(finalizeIssue)
+        .concat(applyConfigToAiIssues(semanticIssues, config))
         .sort((a, b) => severityRank[b.severity] - severityRank[a.severity] || a.fingerprint.localeCompare(b.fingerprint));
     const summary = emptySummary();
     for (const issue of issues) {
@@ -55,23 +59,24 @@ export async function scanProject(options) {
             durationMs: completedAtMs - startedAtMs,
         },
         artifacts: {},
-        featureFlags: ["local-only", "review-first-fixes"],
+        featureFlags: ["local-only", "review-first-fixes", ...(options.enableAiAudit ? ["ai-audit"] : [])],
         redactionNotices: ["Sensitive values are partially redacted in evidence output."],
     };
 }
-async function scanDependencies(rootDir, files, options) {
+async function scanDependencies(rootDir, files, options, config, vexEntries) {
     const packageJsonPath = path.join(rootDir, "package.json");
     const packageJson = await readJsonFile(packageJsonPath);
     if (!packageJson) {
         return [];
     }
     const issues = [];
-    const deps = {
+    const directDeps = {
         ...(packageJson.dependencies ?? {}),
         ...(packageJson.devDependencies ?? {}),
     };
     const packageText = (await readTextIfExists(packageJsonPath)) ?? "";
-    for (const [name, version] of Object.entries(deps)) {
+    const resolvedDependencies = await resolveNodeDependencies(rootDir, directDeps, config.maxDepth);
+    for (const [name, version] of Object.entries(directDeps)) {
         if (/^(\*|latest|\^|~)/.test(version.trim())) {
             issues.push({
                 ruleId: "deps.weak-version-range",
@@ -83,7 +88,8 @@ async function scanDependencies(rootDir, files, options) {
                 evidence: [{ label: "version", value: `${name}@${version}` }],
                 locations: [{ file: relative(rootDir, packageJsonPath), line: findLine(packageText, `\"${name}\"`) }],
                 fixAvailability: "none",
-                source: "package.json",
+                source: "static",
+                remediation: `Pin ${name} to an explicit reviewed version instead of using ${version}.`,
             });
         }
     }
@@ -101,8 +107,24 @@ async function scanDependencies(rootDir, files, options) {
                 evidence: [{ label: scriptName, value: scriptValue }],
                 locations: [{ file: relative(rootDir, packageJsonPath), line: findLine(packageText, `\"${scriptName}\"`) }],
                 fixAvailability: "none",
-                source: "package.json",
+                source: "static",
+                remediation: `Review whether the ${scriptName} lifecycle hook is necessary and remove or sandbox it if possible.`,
             });
+            if (containsSuspiciousInstallScript(scriptValue)) {
+                issues.push({
+                    ruleId: "deps.suspicious-install-script",
+                    category: "dependencies",
+                    severity: "critical",
+                    confidence: 0.94,
+                    title: `Lifecycle script ${scriptName} contains suspicious install behavior`,
+                    why: "Install-time commands that fetch, decode, or execute shell payloads are a common supply-chain compromise pattern.",
+                    evidence: [{ label: scriptName, value: scriptValue }],
+                    locations: [{ file: relative(rootDir, packageJsonPath), line: findLine(packageText, `\"${scriptName}\"`) }],
+                    fixAvailability: "none",
+                    source: "static",
+                    remediation: "Review install script for malicious payload before proceeding.",
+                });
+            }
         }
     }
     const hasLockfile = ["package-lock.json", "pnpm-lock.yaml", "yarn.lock"].some((file) => files.includes(path.join(rootDir, file)));
@@ -117,28 +139,118 @@ async function scanDependencies(rootDir, files, options) {
             evidence: [{ label: "manifest", value: "package.json present without package-lock.json, pnpm-lock.yaml, or yarn.lock" }],
             locations: [{ file: relative(rootDir, packageJsonPath), line: 1 }],
             fixAvailability: "none",
-            source: "package.json",
+            source: "static",
+            remediation: "Generate and commit a lockfile so dependency resolution stays reproducible.",
         });
     }
-    if (options.vulnerabilityProvider) {
-        const vulnerabilities = await options.vulnerabilityProvider.getVulnerabilities(Object.keys(deps), { rootDir });
-        const usage = await discoverDependencyUsage(files, Object.keys(deps));
-        for (const vuln of vulnerabilities) {
-            const used = usage.has(vuln.packageName);
+    const reputationRecords = await collectDependencyReputation(rootDir, resolvedDependencies);
+    for (const dependency of resolvedDependencies) {
+        const reputation = reputationRecords.get(`${dependency.name}@${dependency.version}`);
+        if (!reputation) {
+            continue;
+        }
+        if (reputation.ageDays < 14) {
             issues.push({
-                ruleId: "deps.provider-vulnerability",
+                ruleId: "deps.new-package-risk",
+                category: "dependencies",
+                severity: dependency.depth > 0 ? "medium" : "high",
+                confidence: 0.78,
+                title: `Package ${dependency.name}@${dependency.version} is very new`,
+                why: "Very new packages deserve extra review because supply-chain attacks often rely on recently published packages.",
+                evidence: [{ label: "ageDays", value: String(reputation.ageDays) }],
+                locations: [{ file: relative(rootDir, packageJsonPath), line: findLine(packageText, `\"${dependency.name}\"`) }],
+                fixAvailability: "none",
+                source: "static",
+                remediation: `Review the provenance and necessity of ${dependency.name}@${dependency.version} before adoption.`,
+                depth: dependency.depth,
+                reputation: {
+                    ageDays: reputation.ageDays,
+                    authorPackageCount: reputation.authorPackageCount,
+                },
+            });
+        }
+        if (reputation.authorPackageCount > 0 && reputation.authorPackageCount < 3) {
+            issues.push({
+                ruleId: "deps.unproven-author",
+                category: "dependencies",
+                severity: "medium",
+                confidence: 0.65,
+                title: `Package ${dependency.name}@${dependency.version} is maintained by an unproven author`,
+                why: "Packages from authors with very limited publishing history deserve additional review before being trusted.",
+                evidence: [{ label: "authorPackageCount", value: String(reputation.authorPackageCount) }],
+                locations: [{ file: relative(rootDir, packageJsonPath), line: findLine(packageText, `\"${dependency.name}\"`) }],
+                fixAvailability: "none",
+                source: "static",
+                remediation: `Review the maintainer history and package provenance for ${dependency.name}@${dependency.version}.`,
+                depth: dependency.depth,
+                reputation: {
+                    ageDays: reputation.ageDays,
+                    authorPackageCount: reputation.authorPackageCount,
+                },
+            });
+        }
+        if (reputation.versionJumpSuspicious) {
+            issues.push({
+                ruleId: "deps.suspicious-version-bump",
+                category: "dependencies",
+                severity: "high",
+                confidence: 0.72,
+                title: `Package ${dependency.name}@${dependency.version} has a suspicious rapid major version jump`,
+                why: "A rapid jump from 0.x to 1.x can indicate rushed or potentially malicious release activity and deserves validation.",
+                evidence: [{ label: "package", value: `${dependency.name}@${dependency.version}` }],
+                locations: [{ file: relative(rootDir, packageJsonPath), line: findLine(packageText, `\"${dependency.name}\"`) }],
+                fixAvailability: "none",
+                source: "static",
+                remediation: `Validate the release history and changelog for ${dependency.name}@${dependency.version} before upgrading.`,
+                depth: dependency.depth,
+                reputation: {
+                    ageDays: reputation.ageDays,
+                    authorPackageCount: reputation.authorPackageCount,
+                },
+            });
+        }
+    }
+    if (options.vulnerabilityProvider) {
+        const usage = await discoverDependencyUsage(files, Object.keys(directDeps));
+        const vulnerabilityInputs = resolvedDependencies.map((dependency) => ({
+            name: dependency.name,
+            version: dependency.version,
+            depth: dependency.depth,
+        }));
+        const vulnerabilities = options.vulnerabilityProvider.getPackageVersionVulnerabilities
+            ? await options.vulnerabilityProvider.getPackageVersionVulnerabilities(vulnerabilityInputs, { rootDir })
+            : await options.vulnerabilityProvider.getVulnerabilities(Object.keys(directDeps), { rootDir });
+        for (const vuln of vulnerabilities) {
+            const dependency = resolvedDependencies.find((entry) => entry.name === vuln.packageName && (!vuln.packageVersion || entry.version === vuln.packageVersion));
+            const depth = dependency?.depth ?? 0;
+            const used = depth > 0 ? true : usage.has(vuln.packageName);
+            const aliases = vuln.aliases ?? advisoryAliases(vuln.advisory);
+            const vexStatus = resolveVexStatus(vexEntries, vuln.packageName, vuln.packageVersion, aliases);
+            if (vexStatus === "not_affected") {
+                continue;
+            }
+            issues.push({
+                ruleId: depth > 0 ? "deps.transitive-cve" : "deps.provider-vulnerability",
                 category: "dependencies",
                 severity: used ? vuln.severity : downgradeSeverity(vuln.severity),
                 confidence: 0.8,
-                title: `Dependency ${vuln.packageName} has a provider-reported advisory`,
-                why: used ? "The vulnerable package is referenced in code, increasing practical exposure." : "The package is declared but not referenced in project code, so severity is downgraded until usage is confirmed.",
+                title: `Dependency ${vuln.packageName}${vuln.packageVersion ? `@${vuln.packageVersion}` : ""} has a provider-reported advisory`,
+                why: depth > 0
+                    ? `A transitive dependency at depth ${depth} carries a provider-reported advisory and should be reviewed through the full dependency chain.`
+                    : used
+                        ? "The vulnerable package is referenced in code, increasing practical exposure."
+                        : "The package is declared but not referenced in project code, so severity is downgraded until usage is confirmed.",
                 evidence: [
                     { label: "advisory", value: vuln.advisory },
+                    { label: "package", value: `${vuln.packageName}${vuln.packageVersion ? `@${vuln.packageVersion}` : ""}` },
                     { label: "usage", value: used ? "used in project files" : "no imports detected" },
                 ],
                 locations: [{ file: relative(rootDir, packageJsonPath), line: findLine(packageText, `\"${vuln.packageName}\"`) }],
                 fixAvailability: "none",
-                source: options.vulnerabilityProvider.name,
+                source: "static",
+                remediation: `Upgrade or replace ${vuln.packageName} after reviewing the advisory and dependency usage.`,
+                depth,
+                vexStatus,
             });
         }
     }
@@ -161,6 +273,260 @@ async function discoverDependencyUsage(files, packageNames) {
         }
     }
     return used;
+}
+async function resolveNodeDependencies(rootDir, directDeps, maxDepth) {
+    const resolved = new Map();
+    const lockfile = await readJsonFile(path.join(rootDir, "package-lock.json"));
+    for (const [name, version] of Object.entries(directDeps)) {
+        if (isConcreteVersion(version)) {
+            resolved.set(`${name}@${version}`, { name, version, depth: 0, direct: true });
+        }
+    }
+    if (!lockfile) {
+        return [...resolved.values()].sort(compareResolvedDependencies);
+    }
+    if (lockfile.packages && Object.keys(lockfile.packages).length > 0) {
+        collectFromPackageLockPackages(lockfile.packages, resolved, maxDepth);
+    }
+    else if (lockfile.dependencies) {
+        collectFromPackageLockDependencies(lockfile.dependencies, resolved, 1, maxDepth);
+    }
+    return [...resolved.values()].sort(compareResolvedDependencies);
+}
+function collectFromPackageLockPackages(packages, resolved, maxDepth) {
+    const queue = [{ packagePath: "", depth: 0 }];
+    const visited = new Set();
+    while (queue.length > 0) {
+        const current = queue.shift();
+        if (!current) {
+            continue;
+        }
+        const marker = `${current.packagePath}:${current.depth}`;
+        if (visited.has(marker)) {
+            continue;
+        }
+        visited.add(marker);
+        const entry = packages[current.packagePath];
+        if (!entry?.dependencies) {
+            continue;
+        }
+        for (const dependencyName of Object.keys(entry.dependencies)) {
+            const packagePath = current.packagePath
+                ? path.posix.join(current.packagePath.replace(/\\/g, "/"), "node_modules", dependencyName)
+                : `node_modules/${dependencyName}`;
+            const dependencyEntry = packages[packagePath];
+            const depth = current.depth + 1;
+            if (!dependencyEntry?.version || depth > maxDepth) {
+                continue;
+            }
+            addResolvedDependency(resolved, dependencyName, dependencyEntry.version, depth);
+            queue.push({ packagePath, depth });
+        }
+    }
+}
+function collectFromPackageLockDependencies(dependencies, resolved, depth, maxDepth) {
+    if (depth > maxDepth) {
+        return;
+    }
+    for (const [name, dependency] of Object.entries(dependencies)) {
+        if (dependency.version) {
+            addResolvedDependency(resolved, name, dependency.version, depth);
+        }
+        if (dependency.dependencies) {
+            collectFromPackageLockDependencies(dependency.dependencies, resolved, depth + 1, maxDepth);
+        }
+    }
+}
+function addResolvedDependency(resolved, name, version, depth) {
+    const key = `${name}@${version}`;
+    const existing = resolved.get(key);
+    if (!existing || depth < existing.depth) {
+        resolved.set(key, { name, version, depth, direct: depth === 0 });
+    }
+}
+function compareResolvedDependencies(a, b) {
+    return a.depth - b.depth || a.name.localeCompare(b.name) || a.version.localeCompare(b.version);
+}
+function isConcreteVersion(version) {
+    return !/^(\*|latest|\^|~|>|<|=)/.test(version.trim());
+}
+function containsSuspiciousInstallScript(scriptValue) {
+    const suspiciousPattern = /\b(?:curl|wget|bash|sh|eval|base64)\b|chmod\s+777/i;
+    const obfuscationPattern = /Buffer\.from\(\s*['"`][^'"`]+['"`]\s*,\s*['"`](?:hex|base64)['"`]\s*\)\.toString\(/i;
+    return suspiciousPattern.test(scriptValue) || obfuscationPattern.test(scriptValue);
+}
+async function collectDependencyReputation(rootDir, dependencies) {
+    const reputation = new Map();
+    for (const dependency of dependencies) {
+        const record = await getPackageReputation(rootDir, dependency.name, dependency.version);
+        if (record) {
+            reputation.set(`${dependency.name}@${dependency.version}`, record);
+        }
+    }
+    return reputation;
+}
+async function getPackageReputation(rootDir, pkgName, pkgVersion) {
+    const cache = await readReputationCache(rootDir);
+    const key = `${pkgName}@${pkgVersion}`;
+    const cached = cache[key];
+    if (cached && Date.now() - Date.parse(cached.cachedAt) < 24 * 60 * 60 * 1000) {
+        return cached.record;
+    }
+    try {
+        const response = await fetch(`https://registry.npmjs.org/${encodeURIComponent(pkgName)}`);
+        if (!response.ok) {
+            return undefined;
+        }
+        const payload = await response.json();
+        const publishedAt = payload.time?.[pkgVersion];
+        const ageDays = publishedAt ? Math.max(0, Math.floor((Date.now() - Date.parse(publishedAt)) / (24 * 60 * 60 * 1000))) : Number.MAX_SAFE_INTEGER;
+        const authorName = resolveAuthorName(payload, pkgVersion);
+        const authorPackageCount = authorName ? (await fetchAuthorPackageCount(authorName)) ?? 3 : 3;
+        const versionJumpSuspicious = isSuspiciousVersionJump(pkgVersion, payload.time ?? {});
+        const record = {
+            packageName: pkgName,
+            packageVersion: pkgVersion,
+            ageDays,
+            authorPackageCount,
+            versionJumpSuspicious,
+        };
+        cache[key] = { cachedAt: new Date().toISOString(), record };
+        await writeReputationCache(rootDir, cache);
+        return record;
+    }
+    catch {
+        return undefined;
+    }
+}
+function resolveAuthorName(payload, pkgVersion) {
+    const versionEntry = payload.versions?.[pkgVersion];
+    const versionAuthor = typeof versionEntry?.author === "string" ? versionEntry.author : versionEntry?.author?.name;
+    if (versionAuthor) {
+        return versionAuthor;
+    }
+    const versionMaintainer = versionEntry?.maintainers?.find((item) => item.name)?.name;
+    if (versionMaintainer) {
+        return versionMaintainer;
+    }
+    const rootAuthor = typeof payload.author === "string" ? payload.author : payload.author?.name;
+    if (rootAuthor) {
+        return rootAuthor;
+    }
+    return payload.maintainers?.find((item) => item.name)?.name;
+}
+async function fetchAuthorPackageCount(authorName) {
+    try {
+        const response = await fetch(`https://registry.npmjs.org/-/v1/search?text=maintainer:${encodeURIComponent(authorName)}&size=3`);
+        if (!response.ok) {
+            return undefined;
+        }
+        const payload = await response.json();
+        return payload.total;
+    }
+    catch {
+        return undefined;
+    }
+}
+function isSuspiciousVersionJump(pkgVersion, timeMap) {
+    if (!/^\d+\.\d+\.\d+/.test(pkgVersion)) {
+        return false;
+    }
+    const [major] = pkgVersion.split(".");
+    const currentMajor = Number.parseInt(major, 10);
+    if (Number.isNaN(currentMajor) || currentMajor < 1) {
+        return false;
+    }
+    let latestPreOnePublishedAt;
+    const currentPublishedAt = Date.parse(timeMap[pkgVersion] ?? "");
+    if (Number.isNaN(currentPublishedAt)) {
+        return false;
+    }
+    for (const [version, timestamp] of Object.entries(timeMap)) {
+        if (!/^\d+\.\d+\.\d+/.test(version)) {
+            continue;
+        }
+        const versionMajor = Number.parseInt(version.split(".")[0] ?? "", 10);
+        if (Number.isNaN(versionMajor) || versionMajor >= 1) {
+            continue;
+        }
+        const publishedAt = Date.parse(timestamp);
+        if (!Number.isNaN(publishedAt) && (latestPreOnePublishedAt === undefined || publishedAt > latestPreOnePublishedAt)) {
+            latestPreOnePublishedAt = publishedAt;
+        }
+    }
+    if (latestPreOnePublishedAt === undefined) {
+        return false;
+    }
+    return currentPublishedAt - latestPreOnePublishedAt < 24 * 60 * 60 * 1000;
+}
+async function readReputationCache(rootDir) {
+    const target = path.join(rootDir, ".curatrix", "cache", "reputation.json");
+    try {
+        return (await readJsonFile(target)) ?? {};
+    }
+    catch {
+        console.warn(`[curatrix] Warning: reputation cache ${target} is unavailable or malformed; continuing without cache reuse.`);
+        return {};
+    }
+}
+async function writeReputationCache(rootDir, cache) {
+    const target = path.join(rootDir, ".curatrix", "cache", "reputation.json");
+    try {
+        await writeText(target, JSON.stringify(cache, null, 2));
+    }
+    catch {
+        console.warn(`[curatrix] Warning: reputation cache directory ${path.dirname(target)} is unavailable; continuing without cache persistence.`);
+    }
+}
+async function loadVexEntries(rootDir, config) {
+    const configuredPath = config.vexFile ? path.resolve(rootDir, config.vexFile) : path.join(rootDir, ".curatrix.vex.json");
+    try {
+        const payload = await readJsonFile(configuredPath);
+        if (!payload?.vulnerabilities) {
+            return [];
+        }
+        const productNames = new Map();
+        for (const product of payload.product_tree?.full_product_names ?? []) {
+            if (product.product_id && product.name) {
+                productNames.set(product.product_id, product.name);
+            }
+        }
+        const entries = [];
+        for (const vulnerability of payload.vulnerabilities) {
+            const cve = vulnerability.cve ?? vulnerability.cve_id;
+            if (!cve) {
+                continue;
+            }
+            for (const status of ["not_affected", "fixed"]) {
+                for (const productId of vulnerability.product_status?.[status] ?? []) {
+                    const component = productNames.get(productId) ?? productId;
+                    entries.push({ cve, status, component });
+                }
+            }
+        }
+        return entries;
+    }
+    catch {
+        return [];
+    }
+}
+function resolveVexStatus(vexEntries, packageName, packageVersion, aliases) {
+    const componentMatchers = [
+        `${packageName}${packageVersion ? `@${packageVersion}` : ""}`.toLowerCase(),
+        packageName.toLowerCase(),
+    ];
+    for (const alias of aliases) {
+        const normalizedAlias = alias.toUpperCase();
+        const match = vexEntries.find((entry) => entry.cve.toUpperCase() === normalizedAlias
+            && componentMatchers.some((component) => entry.component.toLowerCase().includes(component)));
+        if (match) {
+            return match.status;
+        }
+    }
+    return undefined;
+}
+function advisoryAliases(advisory) {
+    return advisory.split("|").map((part) => part.trim()).filter((part) => /^CVE-/i.test(part));
 }
 async function scanSecrets(rootDir, files) {
     const issues = [];
@@ -187,7 +553,8 @@ async function scanSecrets(rootDir, files) {
                     evidence: [{ label: "match", value: redact(match[0]) }],
                     locations: [{ file: relative(rootDir, file), line: findLine(content, match[0]) }],
                     fixAvailability: "none",
-                    source: "pattern-scan",
+                    source: "static",
+                    remediation: "Remove the secret from the file, rotate the credential, and move it to a secure secret store.",
                 });
             }
         }
@@ -203,7 +570,8 @@ async function scanSecrets(rootDir, files) {
                     evidence: [{ label: "token", value: redact(token) }],
                     locations: [{ file: relative(rootDir, file), line: findLine(content, token) }],
                     fixAvailability: "none",
-                    source: "entropy-scan",
+                    source: "static",
+                    remediation: "Review the token, remove it if it is sensitive, and store secrets outside tracked files.",
                 });
                 break;
             }
@@ -224,7 +592,8 @@ async function scanSecrets(rootDir, files) {
                 evidence: [{ label: "file", value: ".env present without matching .gitignore rule" }],
                 locations: [{ file: ".gitignore", line: 1 }],
                 fixAvailability: "apply",
-                source: ".gitignore",
+                source: "static",
+                remediation: "Add .env to .gitignore and verify no sensitive environment files are tracked.",
             });
         }
     }
@@ -275,7 +644,8 @@ async function scanGitHistory(rootDir) {
                         ],
                         locations: [{ file: line }],
                         fixAvailability: "none",
-                        source: "git-history",
+                        source: "static",
+                        remediation: "Purge the secret from git history if needed and rotate any affected credentials.",
                     });
                 }
             }
@@ -302,7 +672,8 @@ async function scanInfrastructure(rootDir, files) {
                 evidence: [{ label: "from", value: content.match(/FROM\s+.+/i)?.[0] ?? "FROM <unknown>" }],
                 locations: [{ file: relative(rootDir, dockerfile), line: findLine(content, "FROM") }],
                 fixAvailability: "none",
-                source: "Dockerfile",
+                source: "static",
+                remediation: "Pin the base image to an explicit version or digest instead of relying on latest.",
             });
         }
         if (!/^USER\s+/m.test(content)) {
@@ -316,7 +687,8 @@ async function scanInfrastructure(rootDir, files) {
                 evidence: [{ label: "dockerfile", value: relative(rootDir, dockerfile) }],
                 locations: [{ file: relative(rootDir, dockerfile), line: 1 }],
                 fixAvailability: "apply",
-                source: "Dockerfile",
+                source: "static",
+                remediation: "Add a non-root USER instruction to reduce container privilege at runtime.",
             });
         }
         if (/COPY\s+\.\s+\.([\s\S]*?)RUN\s+/i.test(content)) {
@@ -330,7 +702,8 @@ async function scanInfrastructure(rootDir, files) {
                 evidence: [{ label: "pattern", value: "COPY . . before RUN" }],
                 locations: [{ file: relative(rootDir, dockerfile), line: findLine(content, "COPY . .") }],
                 fixAvailability: "none",
-                source: "Dockerfile",
+                source: "static",
+                remediation: "Copy only the files needed for each build step to improve cache safety and reduce image context.",
             });
         }
     }
@@ -349,7 +722,8 @@ async function scanInfrastructure(rootDir, files) {
                 evidence: [{ label: "setting", value: "privileged: true" }],
                 locations: [{ file: rel, line: findLine(content, "privileged:") }],
                 fixAvailability: "none",
-                source: rel,
+                source: "static",
+                remediation: "Remove privileged mode unless it is absolutely required and documented.",
             });
         }
         if (/echo\s+\$\{\{\s*secrets\./i.test(content)) {
@@ -363,7 +737,8 @@ async function scanInfrastructure(rootDir, files) {
                 evidence: [{ label: "pattern", value: "echo ${{ secrets.* }}" }],
                 locations: [{ file: rel, line: findLine(content, "secrets.") }],
                 fixAvailability: "none",
-                source: rel,
+                source: "static",
+                remediation: "Stop printing secret values in logs and replace them with masked status output.",
             });
         }
         if (rel.startsWith(".github/workflows/") && !/(npm\s+(test|run test)|pnpm\s+test|yarn\s+test)/i.test(content)) {
@@ -377,7 +752,8 @@ async function scanInfrastructure(rootDir, files) {
                 evidence: [{ label: "workflow", value: rel }],
                 locations: [{ file: rel, line: 1 }],
                 fixAvailability: "none",
-                source: rel,
+                source: "static",
+                remediation: "Add an explicit test step to the workflow so regressions are caught before release.",
             });
         }
     }
@@ -403,7 +779,8 @@ async function scanAiAgent(rootDir, files) {
                 evidence: [{ label: "file", value: rel }],
                 locations: [{ file: rel, line: 1 }],
                 fixAvailability: "apply",
-                source: rel,
+                source: "static",
+                remediation: "Wrap the prompt with explicit SYSTEM and USER delimiters to preserve trust boundaries.",
             });
         }
         if (/systemPrompt\s*\+|messages?\.push\(\s*systemPrompt\s*\+|`[^`]*\$\{\s*(?:input|userInput|prompt)\s*\}[^`]*`/i.test(content)) {
@@ -417,7 +794,8 @@ async function scanAiAgent(rootDir, files) {
                 evidence: [{ label: "pattern", value: "direct system/user prompt concatenation" }],
                 locations: [{ file: rel, line: 1 }],
                 fixAvailability: "none",
-                source: rel,
+                source: "static",
+                remediation: "Separate trusted system instructions from user input instead of concatenating them directly.",
             });
         }
         if (/\b(?:eval|exec)\s*\(/i.test(content)) {
@@ -432,7 +810,8 @@ async function scanAiAgent(rootDir, files) {
                 evidence: [{ label: "pattern", value: pattern }],
                 locations: [{ file: rel, line: findLine(content, pattern) }],
                 fixAvailability: "none",
-                source: rel,
+                source: "static",
+                remediation: "Replace eval/exec with an explicit allowlisted execution path or structured command dispatch.",
             });
         }
         if (/0\.0\.0\.0/.test(content)) {
@@ -446,7 +825,8 @@ async function scanAiAgent(rootDir, files) {
                 evidence: [{ label: "bind", value: "0.0.0.0" }],
                 locations: [{ file: rel, line: findLine(content, "0.0.0.0") }],
                 fixAvailability: "apply",
-                source: rel,
+                source: "static",
+                remediation: "Bind the service to 127.0.0.1 unless external access is intentionally required.",
             });
         }
         if (/debug\s*[:=]\s*true/i.test(content)) {
@@ -461,7 +841,8 @@ async function scanAiAgent(rootDir, files) {
                 evidence: [{ label: "pattern", value: pattern }],
                 locations: [{ file: rel, line: findLine(content, pattern) }],
                 fixAvailability: "none",
-                source: rel,
+                source: "static",
+                remediation: "Disable debug mode outside local development to reduce verbose or unsafe runtime behavior.",
             });
         }
     }
@@ -564,12 +945,20 @@ function baselinePath(rootDir, baseDir) {
         evidence: [],
         locations: [{ file: rootDir }],
         fixAvailability: "none",
-        source: "baseline",
+        source: "static",
     }).fingerprint;
     return path.join(baseDir, `${key}.json`);
 }
 function applyConfigToIssues(issues, config) {
     return dedupeIssues(issues
+        .filter((issue) => !config.ignoredRuleIds.includes(issue.ruleId))
+        .map((issue) => ({
+        ...issue,
+        severity: config.severityOverrides[issue.ruleId] ?? issue.severity,
+    })));
+}
+function applyConfigToAiIssues(issues, config) {
+    return dedupeFinalIssues(issues
         .filter((issue) => !config.ignoredRuleIds.includes(issue.ruleId))
         .map((issue) => ({
         ...issue,
@@ -636,6 +1025,17 @@ function dedupeIssues(issues) {
     const seen = new Set();
     return issues.filter((candidate) => {
         const key = JSON.stringify(candidate);
+        if (seen.has(key)) {
+            return false;
+        }
+        seen.add(key);
+        return true;
+    });
+}
+function dedupeFinalIssues(issues) {
+    const seen = new Set();
+    return issues.filter((issue) => {
+        const key = JSON.stringify(issue);
         if (seen.has(key)) {
             return false;
         }

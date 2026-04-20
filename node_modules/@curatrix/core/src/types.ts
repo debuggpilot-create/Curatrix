@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 export type Severity = "low" | "medium" | "high" | "critical";
 export type Category = "dependencies" | "secrets" | "infrastructure" | "ai-agent";
+export type IssueSource = "static" | "ai";
 export type FixAvailability = "none" | "preview" | "apply";
 export type FixRiskLevel = "low" | "medium" | "high";
 export type BaselineStatus = "new" | "resolved" | "unchanged";
@@ -27,9 +28,17 @@ export interface Issue {
   evidence: Evidence[];
   locations: Location[];
   fixAvailability: FixAvailability;
-  source: string;
+  source: IssueSource;
   fingerprint: string;
+  remediation?: string;
+  patch?: string;
   baselineStatus?: BaselineStatus;
+  depth?: number;
+  reputation?: {
+    ageDays: number;
+    authorPackageCount: number;
+  };
+  vexStatus?: "not_affected" | "fixed";
 }
 
 export interface FixPlan {
@@ -103,11 +112,17 @@ export interface VulnerabilityRecord {
   packageName: string;
   severity: Severity;
   advisory: string;
+  packageVersion?: string;
+  aliases?: string[];
 }
 
 export interface PackageVulnProvider {
   name: string;
   getVulnerabilities(packageNames: string[], context: ProviderContext): Promise<VulnerabilityRecord[]>;
+  getPackageVersionVulnerabilities?(
+    packages: Array<{ name: string; version: string; depth?: number }>,
+    context: ProviderContext,
+  ): Promise<VulnerabilityRecord[]>;
 }
 
 export interface AiRiskAnalyzer {
@@ -124,6 +139,8 @@ export interface ScanOptions {
   rootDir: string;
   ci?: boolean;
   vulnerabilityProvider?: PackageVulnProvider;
+  enableAiAudit?: boolean;
+  aiApiKey?: string;
 }
 
 export interface FixOptions {

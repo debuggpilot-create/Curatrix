@@ -31,6 +31,23 @@ export class OsvVulnerabilityProvider {
         }
         return records;
     }
+    async getPackageVersionVulnerabilities(packages, _context) {
+        const records = [];
+        for (const dependency of packages) {
+            if (!dependency.version || /^(\*|latest|\^|~|>|<|=)/.test(dependency.version.trim())) {
+                continue;
+            }
+            const cached = await this.readCache(dependency.name, dependency.version);
+            if (cached) {
+                records.push(...cached);
+                continue;
+            }
+            const fetched = await this.fetchPackage(dependency.name, dependency.version);
+            await this.writeCache(dependency.name, dependency.version, fetched);
+            records.push(...fetched);
+        }
+        return records;
+    }
     async fetchPackage(packageName, version) {
         await this.takeToken();
         try {
@@ -45,8 +62,10 @@ export class OsvVulnerabilityProvider {
             const payload = (await response.json());
             return (payload.vulns ?? []).map((vuln) => ({
                 packageName,
+                packageVersion: version,
                 severity: normalizeSeverity(vuln),
                 advisory: [vuln.id, vuln.summary, ...(vuln.aliases ?? [])].filter(Boolean).join(" | "),
+                aliases: [vuln.id, ...(vuln.aliases ?? [])].filter((value) => Boolean(value)),
             }));
         }
         catch {

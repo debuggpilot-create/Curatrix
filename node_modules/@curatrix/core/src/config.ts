@@ -14,6 +14,8 @@ export interface CuratrixConfig {
   severityOverrides: Record<string, Severity>;
   baselineDir: string;
   ignoredRuleIds: string[];
+  maxDepth: number;
+  vexFile?: string;
 }
 
 interface ConfigFileShape {
@@ -25,6 +27,8 @@ interface ConfigFileShape {
   };
   severityOverrides?: Record<string, string>;
   baselineDir?: string;
+  maxDepth?: number;
+  vexFile?: string;
 }
 
 const DEFAULT_CONFIG: CuratrixConfig = {
@@ -37,6 +41,8 @@ const DEFAULT_CONFIG: CuratrixConfig = {
   severityOverrides: {},
   baselineDir: path.join(os.homedir(), ".curatrix", "baselines"),
   ignoredRuleIds: [],
+  maxDepth: Number.POSITIVE_INFINITY,
+  vexFile: undefined,
 };
 
 export async function loadCuratrixConfig(rootDir: string): Promise<CuratrixConfig> {
@@ -66,6 +72,8 @@ export async function loadCuratrixConfig(rootDir: string): Promise<CuratrixConfi
     },
     baselineDir: projectConfig.baselineDir ?? globalConfig.baselineDir ?? DEFAULT_CONFIG.baselineDir,
     ignoredRuleIds,
+    maxDepth: sanitizeDepth(projectConfig.maxDepth ?? globalConfig.maxDepth ?? DEFAULT_CONFIG.maxDepth),
+    vexFile: sanitizeVexFile(projectConfig.vexFile ?? globalConfig.vexFile),
   };
 }
 
@@ -106,4 +114,18 @@ async function warnIfDirectoryMissing(target: string, label: string): Promise<vo
   } catch {
     console.warn(`[curatrix] Warning: ${label} directory ${target} is missing; using in-memory/default behavior.`);
   }
+}
+
+function sanitizeDepth(value: number): number {
+  if (!Number.isFinite(value)) {
+    return Number.POSITIVE_INFINITY;
+  }
+  if (value < 0) {
+    return 0;
+  }
+  return Math.floor(value);
+}
+
+function sanitizeVexFile(value: string | undefined): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
 }

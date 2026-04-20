@@ -173,3 +173,102 @@ test("scanProject exposes config state and filters ignored rules from results", 
   const overriddenIssue = result.issues.find((issue) => issue.ruleId === "deps.missing-lockfile");
   assert.equal(overriddenIssue?.severity, "critical");
 });
+
+test("dependency scan reports suspicious install scripts, transitive depth, and honors VEX suppression", async () => {
+  const fixture = await fs.mkdtemp(path.join(os.tmpdir(), "curatrix-supply-chain-"));
+
+  await fs.writeFile(
+    path.join(fixture, "package.json"),
+    JSON.stringify({
+      name: "supply-chain-risk",
+      version: "1.0.0",
+      scripts: {
+        postinstall: "node -e \"eval(Buffer.from('6869','hex').toString())\"",
+      },
+      dependencies: {
+        directpkg: "1.2.3",
+      },
+    }, null, 2),
+    "utf8",
+  );
+
+  await fs.writeFile(
+    path.join(fixture, "package-lock.json"),
+    JSON.stringify({
+      name: "supply-chain-risk",
+      lockfileVersion: 2,
+      packages: {
+        "": {
+          dependencies: {
+            directpkg: "1.2.3",
+          },
+        },
+        "node_modules/directpkg": {
+          version: "1.2.3",
+          dependencies: {
+            transitivepkg: "0.0.5",
+          },
+        },
+        "node_modules/directpkg/node_modules/transitivepkg": {
+          version: "0.0.5",
+        },
+      },
+    }, null, 2),
+    "utf8",
+  );
+
+  await fs.writeFile(
+    path.join(fixture, ".curatrix.vex.json"),
+    JSON.stringify({
+      product_tree: {
+        full_product_names: [
+          { product_id: "pkg:directpkg@1.2.3", name: "directpkg@1.2.3" },
+        ],
+      },
+      vulnerabilities: [
+        {
+          cve: "CVE-2024-1111",
+          product_status: {
+            not_affected: ["pkg:directpkg@1.2.3"],
+          },
+        },
+      ],
+    }, null, 2),
+    "utf8",
+  );
+
+  const mockProvider = {
+    name: "mock-osv",
+    async getVulnerabilities() {
+      return [];
+    },
+    async getPackageVersionVulnerabilities() {
+      return [
+        {
+          packageName: "directpkg",
+          packageVersion: "1.2.3",
+          severity: "high",
+          advisory: "CVE-2024-1111 | direct advisory",
+          aliases: ["CVE-2024-1111"],
+        },
+        {
+          packageName: "transitivepkg",
+          packageVersion: "0.0.5",
+          severity: "high",
+          advisory: "CVE-2024-2222 | transitive advisory",
+          aliases: ["CVE-2024-2222"],
+        },
+      ];
+    },
+  };
+
+  const result = await scanProject({ rootDir: fixture, vulnerabilityProvider: mockProvider });
+
+  assert.ok(result.issues.some((issue) => issue.ruleId === "deps.suspicious-install-script"));
+  assert.equal(result.issues.some((issue) => issue.ruleId === "deps.provider-vulnerability"), false);
+
+  const transitive = result.issues.find((issue) => issue.ruleId === "deps.transitive-cve");
+  assert.ok(transitive);
+  assert.equal(transitive?.depth, 2);
+  assert.equal(transitive?.vexStatus, undefined);
+});

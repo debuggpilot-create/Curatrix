@@ -9,5 +9,7 @@ export interface CuratrixConfig {
     severityOverrides: Record<string, Severity>;
     baselineDir: string;
     ignoredRuleIds: string[];
+    maxDepth: number;
+    vexFile?: string;
 }
 export declare function loadCuratrixConfig(rootDir: string): Promise<CuratrixConfig>;

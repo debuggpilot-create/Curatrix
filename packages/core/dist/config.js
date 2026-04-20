@@ -12,6 +12,8 @@ const DEFAULT_CONFIG = {
     severityOverrides: {},
     baselineDir: path.join(os.homedir(), ".curatrix", "baselines"),
     ignoredRuleIds: [],
+    maxDepth: Number.POSITIVE_INFINITY,
+    vexFile: undefined,
 };
 export async function loadCuratrixConfig(rootDir) {
     const globalPath = path.join(os.homedir(), ".curatrix", "config.json");
@@ -36,6 +38,8 @@ export async function loadCuratrixConfig(rootDir) {
         },
         baselineDir: projectConfig.baselineDir ?? globalConfig.baselineDir ?? DEFAULT_CONFIG.baselineDir,
         ignoredRuleIds,
+        maxDepth: sanitizeDepth(projectConfig.maxDepth ?? globalConfig.maxDepth ?? DEFAULT_CONFIG.maxDepth),
+        vexFile: sanitizeVexFile(projectConfig.vexFile ?? globalConfig.vexFile),
     };
 }
 async function safeReadConfig(target) {
@@ -74,5 +78,17 @@ async function warnIfDirectoryMissing(target, label) {
     catch {
         console.warn(`[curatrix] Warning: ${label} directory ${target} is missing; using in-memory/default behavior.`);
     }
+}
+function sanitizeDepth(value) {
+    if (!Number.isFinite(value)) {
+        return Number.POSITIVE_INFINITY;
+    }
+    if (value < 0) {
+        return 0;
+    }
+    return Math.floor(value);
+}
+function sanitizeVexFile(value) {
+    return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
 }
 //# sourceMappingURL=config.js.map

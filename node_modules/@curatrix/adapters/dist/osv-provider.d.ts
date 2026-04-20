@@ -4,6 +4,10 @@ export declare class OsvVulnerabilityProvider implements PackageVulnProvider {
     private availableTokens;
     private lastRefillAt;
     getVulnerabilities(packageNames: string[], context: ProviderContext): Promise<VulnerabilityRecord[]>;
+    getPackageVersionVulnerabilities(packages: Array<{
+        name: string;
+        version: string;
+    }>, _context: ProviderContext): Promise<VulnerabilityRecord[]>;
     private fetchPackage;
     private readDependencyVersions;
     private readCache;
