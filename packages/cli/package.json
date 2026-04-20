@@ -1,6 +1,6 @@
 {
   "name": "curatrix",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "bin": {
     "curatrix": "./dist/index.js"
@@ -17,9 +17,8 @@
     "pack:dry": "npm pack --dry-run"
   },
   "dependencies": {
-    "@curatrix/core": "0.1.0",
-    "@curatrix/adapters": "0.1.0",
+    "@curatrix/adapters": "*",
+    "@curatrix/core": "*",
     "commander": "^14.0.1"
-  },
-  "devDependencies": {}
+  }
 }
