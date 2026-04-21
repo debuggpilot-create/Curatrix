@@ -1,15 +1,20 @@
 {
   "name": "curatrix-mcp-server",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "type": "module",
+  "bin": {
+    "curatrix-mcp-server": "./dist/index.js"
+  },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
-    "build": "tsc -b"
+    "build": "tsc -b",
+    "start": "tsx src/index.ts"
   },
   "dependencies": {
-    "curatrix-core": "*",
     "@modelcontextprotocol/sdk": "^1.12.1",
+    "curatrix-adapters": "*",
+    "curatrix-core": "*",
     "zod": "^3.24.1"
   },
   "devDependencies": {

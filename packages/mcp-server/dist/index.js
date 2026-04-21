@@ -1,3 +1,5 @@
+#!/usr/bin/env node
+import { readFileSync } from "node:fs";
 import { access } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
@@ -5,79 +7,63 @@ import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { OsvVulnerabilityProvider } from "curatrix-adapters";
 import { applyFixes, scanProject } from "curatrix-core";
+const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+const vulnerabilityProvider = new OsvVulnerabilityProvider();
+const server = new McpServer({
+    name: "curatrix-mcp",
+    version: pkg.version,
+});
 const scanInputSchema = {
     path: z.string().optional(),
-    format: z.enum(["json", "text"]).optional(),
+    format: z.enum(["json", "text"]).default("json"),
 };
 const fixInputSchema = {
     path: z.string().optional(),
     issueIds: z.array(z.string()).optional(),
     autoConfirm: z.boolean().default(true),
 };
-const server = new McpServer({
-    name: "curatrix-mcp-server",
-    version: "0.1.0",
-});
-export async function runCuratrixScanTool({ path: targetPath, format, }) {
-    const rootDir = path.resolve(targetPath ?? process.cwd());
-    try {
-        await access(rootDir);
-    }
-    catch {
-        return {
-            content: [
-                {
-                    type: "text",
-                    text: JSON.stringify({
-                        error: `Path does not exist: ${rootDir}`,
-                    }, null, 2),
-                },
-            ],
-            isError: true,
-        };
-    }
-    try {
-        const result = await scanProject({ rootDir });
-        const payload = createScanPayload(result);
-        return {
-            content: [
-                {
-                    type: "text",
-                    text: serializeScanResult(payload, format ?? "json"),
-                },
-            ],
-        };
-    }
-    catch (error) {
-        return {
-            content: [
-                {
-                    type: "text",
-                    text: JSON.stringify({
-                        error: error instanceof Error ? error.message : String(error),
-                    }, null, 2),
-                },
-            ],
-            isError: true,
-        };
-    }
-}
-export async function runCuratrixFixTool({ path: targetPath, issueIds, autoConfirm, }) {
+// Tool: Scan project for vulnerabilities
+server.tool("curatrix_scan", "Scan the current project for security vulnerabilities using Curatrix.", scanInputSchema, async (input) => runCuratrixScanTool(input));
+// Tool: Apply Curatrix fixes
+server.tool("curatrix_fix", "Apply Curatrix fixes for selected issues in the current project.", fixInputSchema, async (input) => runCuratrixFixTool(input));
+export async function runCuratrixScanTool({ path: targetPath, format = "json", }) {
     const rootDir = path.resolve(targetPath ?? process.cwd());
     const validationError = await validateRootDir(rootDir);
     if (validationError) {
         return validationError;
     }
     try {
-        const result = await scanProject({ rootDir });
-        const issues = issueIds?.length
-            ? result.issues.filter((issue) => issueIds.includes(issue.id) || issueIds.includes(issue.fingerprint))
-            : result.issues.filter((issue) => issue.fixAvailability !== "none" || Boolean(issue.patch));
+        const options = {
+            rootDir,
+            vulnerabilityProvider,
+        };
+        const result = await scanProject(options);
+        const payload = createScanPayload(result);
+        return successResponse(serializeScanPayload(payload, format));
+    }
+    catch (error) {
+        return errorResponse(error instanceof Error ? error.message : String(error));
+    }
+}
+export async function runCuratrixFixTool({ path: targetPath, issueIds, autoConfirm = true, }) {
+    const rootDir = path.resolve(targetPath ?? process.cwd());
+    const validationError = await validateRootDir(rootDir);
+    if (validationError) {
+        return validationError;
+    }
+    try {
+        const result = await scanProject({
+            rootDir,
+            vulnerabilityProvider,
+        });
+        const issues = selectIssues(result.issues, issueIds);
         const applyResult = await applyFixes({
             rootDir,
             issues,
-            autoConfirm: autoConfirm ?? true,
+            autoConfirm,
+            vulnerabilityProvider,
         });
         return successResponse({
             rootDir,
@@ -104,25 +90,17 @@ export async function runCuratrixFixTool({ path: targetPath, issueIds, autoConfi
         return errorResponse(error instanceof Error ? error.message : String(error));
     }
 }
-server.tool("curatrix_scan", "Scan the current project for security vulnerabilities using Curatrix.", scanInputSchema, runCuratrixScanTool);
-server.tool("curatrix_fix", "Apply Curatrix fixes for selected issues in the current project.", fixInputSchema, runCuratrixFixTool);
 if (isMainModule(import.meta.url)) {
     const transport = new StdioServerTransport();
     await server.connect(transport);
 }
-function serializeScanResult(result, format) {
-    if (format === "text") {
-        return [
-            "Curatrix scan completed",
-            "",
-            JSON.stringify(result, null, 2),
-        ].join("\n");
-    }
-    return JSON.stringify(result, null, 2);
-}
 function createScanPayload(result) {
     return {
-        ...result,
+        project: result.project,
+        summary: result.summary,
+        policyOutcome: result.policyOutcome,
+        featureFlags: result.featureFlags,
+        config: result.config,
         issues: result.issues.map((issue) => ({
             id: issue.id,
             ruleId: issue.ruleId,
@@ -136,12 +114,27 @@ function createScanPayload(result) {
         })),
     };
 }
+function serializeScanPayload(payload, format) {
+    if (format === "text") {
+        return {
+            summary: `Curatrix found ${payload.summary.totalIssues} issue(s) in ${payload.project.name}.`,
+            result: payload,
+        };
+    }
+    return payload;
+}
+function selectIssues(issues, issueIds) {
+    if (issueIds?.length) {
+        return issues.filter((issue) => issueIds.includes(issue.id) || issueIds.includes(issue.fingerprint));
+    }
+    return issues.filter((issue) => issue.fixAvailability !== "none" || Boolean(issue.patch));
+}
 function buildCorrectionContext(issue) {
     return {
         type: correctionType(issue),
         action: correctionAction(issue),
         reasoning: correctionReasoning(issue),
-        confidence: correctionConfidence(issue),
+        confidence: Math.min(0.99, Math.max(0.5, Number(issue.confidence.toFixed(2)))),
     };
 }
 function correctionType(issue) {
@@ -182,7 +175,7 @@ function correctionReasoning(issue) {
         return `I recommend updating ${packageEvidence ?? "this dependency"} because the current version is tied to a reported vulnerability and the safer version reduces known risk.`;
     }
     if (issue.ruleId === "deps.suspicious-install-script") {
-        return "I recommend reviewing this install script because it contains commands that commonly download, decode, or execute malicious payloads during install.";
+        return "I recommend reviewing this install script because it contains commands that commonly download, decode, or execute risky payloads during install.";
     }
     if (issue.ruleId === "ai.unsafe-exec") {
         return "I recommend removing this dynamic execution path because it can let untrusted input run code directly.";
@@ -191,20 +184,6 @@ function correctionReasoning(issue) {
         return toHumanReasoning(issue.remediation);
     }
     return `I recommend fixing this because ${issue.why.charAt(0).toLowerCase()}${issue.why.slice(1)}`;
-}
-function correctionConfidence(issue) {
-    return Math.min(0.99, Math.max(0.5, Number(issue.confidence.toFixed(2))));
-}
-function toHumanReasoning(input) {
-    const trimmed = input.trim();
-    if (trimmed.length === 0) {
-        return "I made this change because it reduces risk without making a broad or surprising modification.";
-    }
-    const sentence = trimmed.endsWith(".") ? trimmed : `${trimmed}.`;
-    if (/^i\s+/i.test(sentence)) {
-        return sentence;
-    }
-    return `I made this change because ${sentence.charAt(0).toLowerCase()}${sentence.slice(1)}`;
 }
 async function validateRootDir(rootDir) {
     try {
@@ -235,6 +214,17 @@ function errorResponse(message) {
         ],
         isError: true,
     };
+}
+function toHumanReasoning(input) {
+    const trimmed = input.trim();
+    if (trimmed.length === 0) {
+        return "I made this change because it reduces risk without making a broad or surprising modification.";
+    }
+    const sentence = trimmed.endsWith(".") ? trimmed : `${trimmed}.`;
+    if (/^i\s+/i.test(sentence)) {
+        return sentence;
+    }
+    return `I made this change because ${sentence.charAt(0).toLowerCase()}${sentence.slice(1)}`;
 }
 function isMainModule(moduleUrl) {
     return process.argv[1] ? path.resolve(process.argv[1]) === path.resolve(fileURLToPath(moduleUrl)) : false;

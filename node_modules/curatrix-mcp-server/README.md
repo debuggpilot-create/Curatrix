@@ -1,47 +1,66 @@
 # Curatrix MCP Server
 
-`@curatrix/mcp-server` exposes Curatrix scanning and fix workflows over MCP so AI agents can call them as tools over stdio.
+`curatrix-mcp-server` exposes Curatrix scans and fixes as MCP tools over stdio.
 
-## Tools
+## Features
 
-### `curatrix_scan`
+- `curatrix_scan`: scan a project with Curatrix and return structured findings
+- `curatrix_fix`: apply available Curatrix fixes and return a detailed summary
+- OSV-backed vulnerability provider enabled during MCP scans
+- Human-readable correction context for AI agents
 
-Runs a Curatrix scan against the current project or a provided path.
-
-Inputs:
-- `path` (optional): project root to scan
-- `format` (optional): `json` or `text`
-
-Notes:
-- Uses the static Curatrix scan path by default for speed and predictability
-- Returns JSON text by default, including findings, summary, config state, and source metadata
-
-### `curatrix_fix`
-
-Applies Curatrix fixes for selected issues or all fixable issues in a project.
-
-Inputs:
-- `path` (optional): project root to fix
-- `issueIds` (optional): list of issue ids or fingerprints to target
-- `autoConfirm` (optional, default `true`): apply fixes without prompting
-
-Behavior:
-- Runs a fresh scan first
-- Filters to requested issues when `issueIds` is provided
-- Otherwise targets fixable issues only
-- Returns a JSON summary of applied and skipped fixes
-
-## Start the Server
+## Installation
 
 From the workspace root:
+
+```bash
+npm install
+npm run build
+```
+
+Run the server locally:
 
 ```bash
 npm run mcp:start
 ```
 
-## Claude Desktop
+Or from this package directly:
 
-Add Curatrix to your Claude Desktop MCP config:
+```bash
+npm --workspace curatrix-mcp-server run start
+```
+
+## Tool Reference
+
+### `curatrix_scan`
+
+Inputs:
+
+- `path` optional project root, defaults to the current working directory
+- `format` optional `json` or `text`, defaults to `json`
+
+Returns:
+
+- project metadata
+- scan summary
+- issue list with `correctionContext`
+
+### `curatrix_fix`
+
+Inputs:
+
+- `path` optional project root, defaults to the current working directory
+- `issueIds` optional list of issue ids or fingerprints
+- `autoConfirm` optional boolean, defaults to `true`
+
+Returns:
+
+- `fixedCount`
+- selected issues with correction context
+- `changes`
+- `skipped`
+
+## Claude Desktop / Cursor Example
 
 ```json
 {
@@ -53,34 +72,4 @@ Add Curatrix to your Claude Desktop MCP config:
     }
   }
 }
-```
-
-## Cursor
-
-Example MCP server entry for Cursor:
-
-```json
-{
-  "mcpServers": {
-    "curatrix": {
-      "command": "npm",
-      "args": ["run", "mcp:start"],
-      "cwd": "C:\\Users\\rishi\\Curatrix"
-    }
-  }
-}
-```
-
-## Development
-
-Build the workspace:
-
-```bash
-npm run build
-```
-
-Smoke test the server:
-
-```bash
-$null | npm run mcp:start
 ```

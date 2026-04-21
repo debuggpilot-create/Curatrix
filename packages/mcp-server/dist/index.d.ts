@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 export declare function runCuratrixScanTool({ path: targetPath, format, }: {
     path?: string;
     format?: "json" | "text";
@@ -6,13 +7,6 @@ export declare function runCuratrixScanTool({ path: targetPath, format, }: {
         type: "text";
         text: string;
     }[];
-    isError: boolean;
-} | {
-    content: {
-        type: "text";
-        text: string;
-    }[];
-    isError?: undefined;
 }>;
 export declare function runCuratrixFixTool({ path: targetPath, issueIds, autoConfirm, }: {
     path?: string;
