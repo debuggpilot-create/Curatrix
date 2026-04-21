@@ -3,6 +3,12 @@
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
+    "baseUrl": ".",
+    "paths": {
+      "curatrix-core": ["packages/core/src/index.ts"],
+      "curatrix-adapters": ["packages/adapters/src/index.ts"],
+      "curatrix-mcp-server": ["packages/mcp-server/src/index.ts"]
+    },
     "strict": true,
     "declaration": true,
     "sourceMap": true,

@@ -4,7 +4,7 @@ import { promises as fs } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { applyPatch, parsePatch } from "diff";
-import { applyFix, createFixPlan } from "@curatrix/core";
+import { applyFix, createFixPlan } from "curatrix-core";
 const execFileAsync = promisify(execFile);
 export async function applyFixes({ rootDir, issues, autoConfirm, vulnerabilityProvider }) {
     const applied = [];

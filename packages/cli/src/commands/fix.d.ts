@@ -1,4 +1,4 @@
-import { type Issue, type PackageVulnProvider } from "@curatrix/core";
+import { type Issue, type PackageVulnProvider } from "curatrix-core";
 interface ApplyFixesOptions {
     rootDir: string;
     issues: Issue[];
