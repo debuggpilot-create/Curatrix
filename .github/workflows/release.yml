@@ -53,14 +53,14 @@ jobs:
       - name: Build
         run: npm run build
 
-      # 1. Publish Core First
-      - name: Publish @curatrix/core
+      # 1. Publish Core First (UNSCOPED NAME)
+      - name: Publish curatrix-core
         run: cd packages/core && npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}
 
-      # 2. Publish Adapters Second
-      - name: Publish @curatrix/adapters
+      # 2. Publish Adapters Second (UNSCOPED NAME)
+      - name: Publish curatrix-adapters
         run: cd packages/adapters && npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}
@@ -68,5 +68,11 @@ jobs:
       # 3. Publish CLI Last
       - name: Publish curatrix
         run: cd packages/cli && npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}
+
+      # 4. Publish MCP Server (NEW!)
+      - name: Publish curatrix-mcp-server
+        run: cd packages/mcp-server && npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}
